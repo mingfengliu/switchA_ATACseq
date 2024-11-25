@@ -1,0 +1,809 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load libraries
+```{r}
+library(rtracklayer)
+library(tidyverse)
+library(GenomicRanges)
+library(DESeq2)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(seriation)
+library(txdbmaker)
+library(rtracklayer)
+library(apeglm)
+```
+
+# Load consensus peak annotation, featureCounts output, and gene annotation
+```{r}
+peak_annotation <- read.table("~/Desktop/ATACseq/LINC00667/rawdata/narrow/consensus/consensus_peaks.mRp.clN.annotatePeaks.txt", sep = "\t", header = T)
+colnames(peak_annotation)[1] <- "interval_id"
+# Check the data types of each column
+print(sapply(peak_annotation, class))
+# Check if any peaks are unannotated
+print(sum(peak_annotation$Annotation == "Unannotated" | is.na(peak_annotation$Annotation)))
+
+peak_counts <- read.table("~/Desktop/ATACseq/LINC00667/rawdata/narrow/consensus/consensus_peaks.mRp.clN.featureCounts.txt", sep = "\t", header = TRUE, skip = 1)
+# Distribution of counts across samples
+print(summary(peak_counts[, -c(1:6)]))
+# Check peak distribution per chr -> remove any nonstandard Chr?
+print(table(peak_counts$Chr))
+# Check for reasonable peak lenghts
+print(summary(peak_counts$Length))
+
+#gencode <- rtracklayer::import(file.path("/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gtf"))
+#genes <- gencode[gencode$type == "gene"]
+#rtracklayer::export(genes, "/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gene.gtf")
+genes <- rtracklayer::import(file.path("~/Desktop/ATACseq/genomes/gencode.v38.annotation.gene.gtf"))
+names(genes) <- genes$gene_id
+# Remove pseudogenes
+genes <- genes[!grepl("pseudogene", genes$gene_type), ]
+ 
+save(peak_annotation, peak_counts, genes, file = "~/Desktop/ATACseq/LINC00667/results/atac_merged_replicate_narrow.RData")
+```
+
+#Clean up and factor peak counts
+```{r}
+colnames(peak_counts) <- gsub(".mLb.clN.sorted.bam","",colnames(peak_counts))
+rownames(peak_counts) <- peak_counts$Geneid
+peak_counts <- peak_counts[, 7:ncol(peak_counts), drop = FALSE] %>% as.matrix()
+
+col_data <- data.frame("sample_name" = colnames(peak_counts)) 
+#col_data$timepoint <- gsub(".*?_(\\d+\\.?\\d*h?)_REP[123]", "\\1", col_data$sample_name)
+col_data$timepoint <- gsub(".*?\\.(\\d+\\.?\\d*h?)_REP[123]", "\\1", col_data$sample_name)
+col_data$condition <- ifelse(grepl("0h", col_data$timepoint), "control", 
+                     ifelse(grepl("GFP", col_data$sample_name), "control", "LINC00667"))
+col_data$transgene <- ifelse(grepl("GFP", col_data$sample_name), "GFP", "LINC00667")
+
+col_data$condition <- factor(col_data$condition, levels = c("control", "LINC00667"))
+col_data$timepoint <- factor(col_data$timepoint, levels = c("0h", "0.5h", "1h", "1.5h", "2h", "2.5h"))
+levels(col_data$timepoint)
+levels(col_data$condition)
+```
+
+#DESeq2 for LINC00667 vs GFP ~ condition
+```{r}
+stopifnot(all(colnames(peak_counts) == col_data$sample_name))
+
+atac_dds <- DESeqDataSetFromMatrix(countData = peak_counts, 
+                                   colData = col_data, 
+                                   design = ~ condition)
+
+atac_dds <- DESeq(atac_dds, test = "LRT", reduce = ~ 1)
+
+resultsNames(atac_dds)
+
+atac_lfc <- results(atac_dds) %>% as.data.frame() %>%
+  rownames_to_column("interval_id") %>%
+  merge(peak_annotation %>% dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                                  Distance.to.TSS, Chr, Start, End), 
+        by = "interval_id", all.x = TRUE)
+
+atac_lfc <- atac_lfc %>%
+  mutate(ucsc_coord = paste(Chr, Start, End, sep = "-"))
+
+plotMA(atac_dds, ylim = c(-3, 3)) 
+plotPCA(vst(atac_dds), intgroup = c("condition", "timepoint"))
+hist(atac_lfc$padj)
+hist(atac_lfc$pvalue)
+hist(atac_lfc$log2FoldChange)
+
+atac_sig <- atac_lfc %>% filter(padj < 0.05)
+length(unique(atac_sig$interval_id))
+#19416
+save(atac_dds, atac_lfc, atac_sig, file = "~/Desktop/ATACseq/LINC00667/results/narrow_LINC00667_vs_GFP_atac_dds_lfc_shrnklfc.RData")
+```
+
+#DESeq2 for GFP(DOX) ~ timepoint
+```{r}
+#GFP(DOX) ~time
+dox_col_data <- col_data %>%
+  filter(grepl("GFP", transgene))
+
+GFP_peak_counts <- peak_counts[,dox_col_data$sample_name]
+
+stopifnot(all(colnames(GFP_peak_counts) == dox_col_data$sample_name))
+
+GFP_atac_dds <- DESeqDataSetFromMatrix(countData = GFP_peak_counts, 
+                                            colData = dox_col_data, 
+                                            design = ~ timepoint)
+
+GFP_atac_dds <- DESeq(GFP_atac_dds, test = "LRT", reduced = ~ 1)
+
+resultsNames(GFP_atac_dds)
+
+GFP_atac_res <- resultsNames(GFP_atac_dds)
+GFP_atac_res <- GFP_atac_res[grepl("timepoint", GFP_atac_res)]
+  
+GFP_atac_lfc <- lapply(GFP_atac_res, function(x) {
+    results(GFP_atac_dds, name = x) %>%
+      as.data.frame() %>%
+      rownames_to_column("interval_id") %>% 
+      mutate(result_name = x,
+             timepoint = as.numeric(sub("timepoint_(\\d+\\.?\\d*)h_vs_0h", "\\1", result_name)))
+  }) %>% bind_rows() %>% merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+
+  names(GFP_atac_lfc)[10] <- "gene_name"
+  names(GFP_atac_lfc)[11] <- "gene_id"
+
+hist(GFP_atac_lfc$padj)
+
+GFP_atac_sig <- GFP_atac_lfc %>% filter(padj < 0.05)
+length(unique(GFP_atac_sig$interval_id))
+#13
+hist(GFP_atac_sig$padj)
+save(GFP_atac_dds, GFP_atac_lfc, GFP_atac_sig, file = "~/Desktop/ATACseq/LINC00667/results/narrow_GFP_timepoint_atac_dds_lfc_shrnklfc.RData")
+```
+
+#DESeq2 dor LINC00667 ~ timepoint
+```{r}
+LINC00667_col_data <- col_data %>%
+  filter(grepl("LINC00667", transgene))
+
+LINC00667_peak_counts <- peak_counts[,LINC00667_col_data$sample_name]
+  
+stopifnot(all(colnames(LINC00667_peak_counts) == LINC00667_col_data$sample_name))
+
+LINC00667_atac_dds <- DESeqDataSetFromMatrix(countData = LINC00667_peak_counts, 
+                                            colData = LINC00667_col_data, 
+                                            design = ~ timepoint)
+
+LINC00667_atac_dds <- DESeq(LINC00667_atac_dds, test = "LRT", reduced = ~ 1)
+
+resultsNames(LINC00667_atac_dds)
+
+LINC00667_atac_res <- resultsNames(LINC00667_atac_dds)
+LINC00667_atac_res <- LINC00667_atac_res[grepl("timepoint", LINC00667_atac_res)]
+  
+LINC00667_atac_lfc <- lapply(LINC00667_atac_res, function(x) {
+    results(LINC00667_atac_dds, name = x) %>%
+      as.data.frame() %>%
+      rownames_to_column("interval_id") %>% 
+      mutate(result_name = x,
+             timepoint = as.numeric(sub("timepoint_(\\d+\\.?\\d*)h_vs_0h", "\\1", result_name)))
+  }) %>% bind_rows() %>% merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+
+  names(LINC00667_atac_lfc)[10] <- "gene_name"
+  names(LINC00667_atac_lfc)[11] <- "gene_id"
+
+hist(LINC00667_atac_lfc$padj)
+LINC00667_atac_sig <- LINC00667_atac_lfc %>% filter(padj < 0.05)
+length(unique(LINC00667_atac_sig$interval_id))
+
+#LINC00667_atac_sig <- LINC00667_atac_lfc %>%
+ # filter(interval_id %in% atac_sig$interval_id)
+
+#LINC00667_atac_sig <- LINC00667_atac_sig %>%
+#  filter(!interval_id %in% GFP_atac_sig$interval_id)
+
+#length(unique(LINC00667_atac_sig$interval_id))
+
+save(LINC00667_atac_sig, file = "~/Desktop/ATACseq/LINC00667/results/narrow_LINC00667_sig_peaks.RData")
+save(LINC00667_atac_dds, LINC00667_atac_lfc, file = "~/Desktop/ATACseq/LINC00667/results/narrow_LINC00667_timepoint_atac_dds_lfc_shrnklfc.RData")
+```
+
+#Find overlaps between ATAC-seq peaks and promoter regions of differentially expressed genes
+```{r}
+peak_annotation_gr <- GRanges(seqnames = peak_annotation$Chr,
+                             IRanges(start = peak_annotation$Start,
+                                     end = peak_annotation$End),
+                             interval_id = peak_annotation$interval_id)
+
+load("~/Desktop/RNAseq/LINC00667/results/LINC00667_res_df.RData")
+
+sig_atac_gr <- peak_annotation_gr[peak_annotation_gr$interval_id %in% unique(LINC00667_atac_sig$interval_id)]
+
+# making a promoters GenomicRanges with promoters function
+promoters_gr <- promoters(genes, upstream = 1, downstream = 1)
+promoters_df <- promoters_gr %>% as.data.frame() %>%
+  
+  # taking all genes except processed pseudogenes
+  filter(gene_type %in% c("protein_coding", "processed_transcript", "bidirectional_promoter_lncRNA",
+                          "antisense", "lincRNA", "sense_intronic"))
+
+# finding overlaps of promoter regions in promoters_df
+promoters_gr <- promoters_gr[promoters_gr$gene_id %in%promoters_df$gene_id]
+
+# establishing peak centers building Ranges for sig atac peaks
+# divide peak by two adn connect to start point
+peak_centers <- start(sig_atac_gr) + round(width(sig_atac_gr)/2)
+sig_atac_center <- GRanges(seqnames = seqnames(sig_atac_gr),
+                           ranges = IRanges(start = peak_centers,
+                                            end = peak_centers),
+                           # naming peak
+                           interval_id = sig_atac_gr$interval_id)
+
+# setting peak to 50Kb up and downstream from peak center
+offset <- 5e4
+
+# creating 10Kb up and downstream of peak center with offset
+# NOTE if you run twice it will affet the results !!
+# Start and end are accessor functions to go into these values
+start(sig_atac_center) <- start(sig_atac_center) - offset
+end(sig_atac_center) <- end(sig_atac_center) + offset
+
+# overlaps with TSS for sig atac peak centers
+# NOTE the ordering of overlaps matters for the lines below
+peak_tss_overlaps <- findOverlaps(promoters_gr, sig_atac_center)
+
+# making Granges into data frame
+atac_df <- sig_atac_center %>% as.data.frame()
+promoters_df <- promoters_gr %>% as.data.frame()
+
+# finding a bunch of overlapping features with atac peak centers 
+# @to is atac sig GR @ from is promters GR
+overlapping_df <- atac_df[peak_tss_overlaps@to, ]
+overlapping_df$gene_id <- promoters_df$gene_id[peak_tss_overlaps@from]
+overlapping_df$gene_name <- promoters_df$gene_name[peak_tss_overlaps@from]
+overlapping_df$gene_tss <- promoters_df$start[peak_tss_overlaps@from]
+overlapping_df$gene_chr <- promoters_df$seqnames[peak_tss_overlaps@from]
+overlapping_df$gene_strand <- promoters_df$strand[peak_tss_overlaps@from]
+
+# calculating distance from TSS
+# subtracting peak center from the TSS to find distance
+overlapping_df <- overlapping_df %>%
+  mutate(dist_to_tss = gene_tss - (start+offset),
+         dist_to_peak = (start+offset) - gene_tss)
+
+# some distances are positive and negative depending on up or down stream
+# fixing to plot so they are all in the same 
+# Flip the minus strand differences so that it's a TSS centric view
+overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] <- -1* overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] 
+
+# finding overlaps with sig genes in short combined
+overlapping_df$deg <- overlapping_df$gene_name %in%LINC00667_trend_sig_filtered$gene_name
+length(unique(overlapping_df$interval_id))
+
+overlapping_df_filtered <- 
+  overlapping_df %>% 
+  filter(deg == TRUE)
+length(unique(overlapping_df_filtered$gene_name))
+
+LINC00667_atac_lfc_overlap_peaks <- 
+  LINC00667_atac_sig %>% 
+  filter(interval_id %in% overlapping_df_filtered$interval_id)
+
+length(unique(LINC00667_atac_lfc_overlap_peaks$interval_id))
+#narrow_667: 702  broad_667: 685
+
+# Calculate the sum_fc
+  LINC00667_atac_lfc_overlap_peaks_sum_fc <- LINC00667_atac_lfc_overlap_peaks %>%
+    group_by(interval_id) %>%
+    summarize(sum_fc = sum(log2FoldChange)) 
+  
+  # merge max shrnklfc into dataframe
+  LINC00667_atac_lfc_overlap_peaks <- LINC00667_atac_lfc_overlap_peaks %>%
+    left_join(LINC00667_atac_lfc_overlap_peaks_sum_fc)
+  
+   # Ensure unique interval_id-to-gene_name mapping in overlapping_df_filtered
+overlapping_df_filtered_unique <- overlapping_df_filtered %>%
+   filter(deg == TRUE) %>%
+  group_by(interval_id) %>%
+  summarise(gene_name = paste(unique(gene_name), collapse = ";"), .groups = "drop")
+
+# Perform the join with the unique overlapping_df_filtered
+LINC00667_atac_lfc_overlap_peaks_updated <- LINC00667_atac_lfc_overlap_peaks %>%
+  left_join(overlapping_df_filtered_unique, by = "interval_id") %>%
+  mutate(gene_name = coalesce(gene_name.y, gene_name.x)) %>%
+  select(-gene_name.x, -gene_name.y)
+
+# View the updated data
+head(LINC00667_atac_lfc_overlap_peaks_updated)
+  
+save(overlapping_df, overlapping_df_filtered, LINC00667_atac_lfc_overlap_peaks, LINC00667_atac_lfc_overlap_peaks_updated, file = "~/Desktop/ATACseq/LINC00667/results/broad_LINC00667_overlappin_peaks.RData")
+
+```
+
+#look data global
+```{r}
+# Calculate the sum_fc
+  LINC00667_atac_sig_sum_fc <- LINC00667_atac_sig %>%
+    group_by(interval_id) %>%
+    summarize(sum_fc = sum(log2FoldChange)) 
+  
+  # merge max shrnklfc into dataframe
+  LINC00667_atac_sig <- LINC00667_atac_sig %>%
+    left_join(LINC00667_atac_sig_sum_fc)
+  
+   # Ensure unique interval_id-to-gene_name mapping in overlapping_df_filtered
+overlapping_df_unique <- overlapping_df %>%
+  filter(deg == TRUE) %>%  # Filter only rows where deg is TRUE
+  group_by(interval_id) %>%
+  summarise(gene_name = paste(unique(gene_name), collapse = ";"), .groups = "drop")
+
+
+# Perform the join with the unique overlapping_df_filtered
+LINC00667_atac_sig_updated <- LINC00667_atac_sig %>%
+  left_join(overlapping_df_unique, by = "interval_id") %>%
+  mutate(gene_name = coalesce(gene_name.y, gene_name.x)) %>%
+  select(-gene_name.x, -gene_name.y)
+
+# View the updated data
+head(LINC00667_atac_sig_updated)
+
+length(unique(LINC00667_atac_sig_updated$interval_id))
+# 22853
+ length(unique(LINC00667_atac_sig_updated$gene_name))
+# 17195
+ 
+#filter sum_lfc < 1 or sum_lfc>-1
+filtered_LINC00667_atac_sig_updated <- LINC00667_atac_sig_updated[
+  (LINC00667_atac_sig_updated$sum_fc >= 1 & LINC00667_atac_sig_updated$sum_fc > 0) |
+  (LINC00667_atac_sig_updated$sum_fc <= -1 & LINC00667_atac_sig_updated$sum_fc < 0), 
+]
+
+length(unique(filtered_LINC00667_atac_sig_updated$interval_id))
+# 18864
+length(unique(peak_counts$Geneid))
+# 330350
+length(unique(LINC00667_atac_lfc$interval_id))
+# 301560
+length(unique(filtered_LINC00667_atac_sig_updated$gene_name))
+# 14814
+
+# Add the rnaseq_sig column
+LINC00667_atac_sig_updated <- LINC00667_atac_sig_updated %>%
+  mutate(
+    rnaseq_sig = if_else(
+      gene_name %in% LINC00667_trend_sig_filtered$gene_name, 
+      TRUE, 
+      FALSE
+    )
+  )
+
+# plot for sum_fc
+ggplot(LINC00667_atac_sig_updated, aes(x = sum_fc, fill = rnaseq_sig)) +
+  geom_density(adjust = 1.2, alpha = 0.6) +
+  scale_fill_manual(values = c("FALSE" = "#424242", "TRUE" = "#a8404c")) +
+  labs(
+    title = "Density Plot of sum_fc",
+    x = "sum_fc",
+    y = "Density",
+    fill = "RNA-seq Significant"
+  ) +
+  theme_minimal()
+
+ggplot(LINC00667_atac_sig_updated, aes(x = sum_fc, fill = rnaseq_sig)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("FALSE" = "gray", "TRUE" = "#a8404c")) +
+  theme_minimal()
+
+# plot for baseMean
+ggplot(LINC00667_atac_sig_updated, aes(x = log10(baseMean), fill = rnaseq_sig)) +
+  geom_density(adjust = 1.2, alpha = 0.6) +
+  scale_fill_manual(values = c("FALSE" = "#424242", "TRUE" = "#a8404c")) +
+  labs(
+    title = "Density Plot of baseMean",
+    x = "baseMean",
+    y = "Density",
+    fill = "RNA-seq Significant"
+  ) +
+  theme_minimal()
+
+ggplot(LINC00667_atac_sig_updated, aes(x = log10(baseMean), fill = rnaseq_sig)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("FALSE" = "gray", "TRUE" = "#a8404c")) +
+  theme_minimal()
+
+# plot for log2FoldChange
+ggplot(LINC00667_atac_sig_updated, aes(x = log2FoldChange, fill = rnaseq_sig)) +
+  geom_density(adjust = 1.2, alpha = 0.6) +
+  scale_fill_manual(values = c("FALSE" = "#424242", "TRUE" = "#a8404c")) +
+  labs(
+    title = "Density Plot of log2FoldChange",
+    x = "log2FoldChange",
+    y = "Density",
+    fill = "RNA-seq Significant"
+  ) +
+  theme_minimal()
+
+ggplot(LINC00667_atac_sig_updated, aes(x = log2FoldChange, fill = rnaseq_sig)) +
+  geom_histogram(binwidth = 0.1, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("FALSE" = "gray", "TRUE" = "#a8404c")) +
+  theme_minimal()
+
+
+
+LINC00667_atac_sig_updated_overlap <- LINC00667_atac_sig_updated %>%
+  filter(interval_id %in% LINC00667_atac_lfc_overlap_peaks_updated$interval_id)
+length(unique(LINC00667_atac_sig_updated_overlap$interval_id))
+
+# plot for sum_fc
+ggplot(LINC00667_atac_sig_updated_overlap, aes(x = sum_fc, fill = rnaseq_sig)) +
+  geom_density(adjust = 1.2, alpha = 0.6)  +
+  labs(
+    title = "Density Plot of sum_fc",
+    x = "sum_fc",
+    y = "Density",
+    fill = "RNA-seq Significant"
+  ) +
+  theme_minimal()
+
+unique_mapping <- LINC00667_atac_sig_updated_overlap %>%
+  distinct(sum_fc, gene_name) %>%
+  mutate(
+    # Mark RNA-seq trend as "down" if gene_name is in LINC00667_trend_sig_down, otherwise mark as "up"
+    rna_seq_trend = case_when(
+      gene_name %in% LINC00667_trend_sig_down$gene_name ~ "down",
+      gene_name %in% LINC00667_trend_sig_up$gene_name ~ "up",
+      TRUE ~ "unknown"  # If gene_name is in neither, mark as "unknown" (you can adjust this)
+    )
+  )
+
+
+ggplot(LINC00667_atac_sig_updated_overlap, aes(x = sum_fc, y = gene_name)) +
+  # Scatter plot with points representing sum_fc and gene_name
+  geom_point(alpha = 0.6, color = "gray") +
+  labs(
+    title = "Scatter Plot of sum_fc vs Gene Name",
+    x = "sum_fc",
+    y = "Gene Name"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1), 
+    axis.text.y = element_text(size = 8)
+  )
+
+
+# Assuming LINC00667_trend_sig_down and LINC00667_trend_sig_up are data frames with 'gene_name' column
+
+# Create the unique_mapping with added RNA-seq trend, ATAC-seq trend, and picked_by_eye
+unique_mapping <- LINC00667_atac_sig_updated_overlap %>%
+  distinct(sum_fc, gene_name) %>%
+  mutate(
+    # Mark RNA-seq trend as "down" if gene_name is in LINC00667_trend_sig_down, otherwise mark as "up"
+    rna_seq_trend = case_when(
+      gene_name %in% LINC00667_trend_sig_down_filtered$gene_name ~ "down",
+      gene_name %in% LINC00667_trend_sig_up_filtered$gene_name ~ "up",
+      TRUE ~ "unknown"  # If gene_name is in neither, mark as "unknown"
+    ),
+    
+    # Mark ATAC-seq trend based on sum_fc
+    atac_seq_trend = case_when(
+      sum_fc > 0 ~ "up",
+      sum_fc < 0 ~ "down",
+      TRUE ~ "unknown"  # If sum_fc is 0, mark as "unknown"
+    ),
+    
+    # Check if RNA-seq and ATAC-seq trends are the same
+    same_trend = case_when(
+      rna_seq_trend == atac_seq_trend ~ "same",  # If trends are the same, mark as "same"
+      TRUE ~ "different"  # Otherwise mark as "different"
+    ),
+    
+    # Mark genes as picked_by_eye (this could be based on your own condition)
+    picked_by_eye = ifelse(gene_name %in% c("PAPLN", "ADPRHL1", "ADRA2A", "AGFG2", "ALCAM", "AP2A2", "APC2", "CA11", "CABP7", "CACHD1", "CAPN11", "CPT1B", "CRABP2", "DRD4", "ENO3", "ERICH2", "FAAH", "FAM227A", "FRY", "GCNT1", "GPR61", "HGSNAT", "HTR1D", "IGFBP3", "INSYN1", "IZUMO4", "KREMEN2", "LIMCH1", "LRP2", "LRRN1", "MOK", "MYL5", "NGF", "NOXA1", "PAQR6", "PI4KA", "PPP1R1B", "PPRT3", "RFTN2", "RP11-295K3.1", "SEMA3B", "SLC4A8", "SLC12A5", "SLC38A3", "SSBP2", "STY10", "TMPRSS2", "WNT4", "WNT5A", "WSCD2", "ZGLP1", "ZNF497"), "yes", "no")
+  )
+
+# View the result
+head(unique_mapping)
+num_matches <- sum(unique_mapping$same_trend == "same")
+#356
+num_ML <- sum(unique_mapping$picked_by_eye == "yes")
+#227
+
+ggplot(unique_mapping, aes(x = sum_fc, y = gene_name)) +
+  geom_point(aes(color = same_trend, shape = picked_by_eye), alpha = 0.6) +  # Color by same_trend, shape by picked_by_eye
+  scale_color_manual(values = c("same" = "#a8404c", "different" = "gray")) +  # Customize colors for same and different
+  scale_shape_manual(values = c("yes" = 17, "no" = 19)) +  # Customize shapes for picked_by_eye
+  labs(
+    title = "Scatter Plot of sum_fc vs Gene Name with Trend Comparison and Manual Selection",
+    x = "sum_fc",
+    y = "Gene Name",
+    color = "Trend Comparison",  # Legend for trend comparison (same vs different)
+    shape = "Picked by Eye"   # Legend for picked by eye
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for better readability
+    axis.text.y = element_text(size = 8),  # Adjust size of y-axis labels
+    plot.margin = margin(1, 1, 1, 3, "cm")  # Adjust left margin to create more space
+  )
+
+
+```
+
+#Volcano plot of sig peaks
+```{r}
+# making a new col of random values "runif" r uniform dist
+overlapping_df$y <- runif(nrow(overlapping_df))
+
+
+# plotting position of ATAC peak distance to nearest TSS
+ggplot(overlapping_df %>% filter(gene_name != "LINC00667", deg == TRUE), aes(x = dist_to_peak, fill = deg)) +
+  geom_density(adjust = 1.2) +
+  geom_vline(xintercept = 0, lty = 2) +
+  geom_rug() +
+  scale_fill_manual(values = c("#424242","#a8404c")) +
+  scale_x_continuous(breaks = seq(from = -1e5, to = 1e5, by = 5e4),
+                     labels = c("-100", "-50", "TSS", "50", "100"),
+                     limits = c(-1e5,1e5))
+
+
+ggsave("~/Desktop/ATACseq/LINC00667/figures/narrow_LINC00667_atac_peak_tss_density.pdf", height = 5, width = 5.5)
+
+# Add significance label
+atac_lfc <- atac_lfc %>%
+  mutate(sig = ifelse(padj < 0.05, "sig", "ns"))
+
+# Sample 500 non-significant peaks for plotting
+atac_lfc_ns <- atac_lfc %>%
+  dplyr::filter(sig == "ns", !is.na(padj)) %>%
+  sample_n(500)
+
+# Combine significant and sampled non-significant peaks
+atac_lfc_subset <- bind_rows(atac_lfc %>% filter(sig == "sig"), atac_lfc_ns)
+
+# Summarize the direction of significant peaks (up/down)
+atac_lfc_summary <- atac_lfc %>%
+  dplyr::filter(sig == "sig") %>%
+  distinct(Gene.Name, .keep_all = TRUE) %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "up", "down")) %>%
+  group_by(direction) %>%
+  summarize(count = n(), .groups = 'drop')
+
+# Extract the up and down counts from the summary
+up_count <- atac_lfc_summary$count[atac_lfc_summary$direction == "up"]
+down_count <- atac_lfc_summary$count[atac_lfc_summary$direction == "down"]
+
+# Plotting 
+ggplot(atac_lfc_subset, aes(x = log2FoldChange, y = -log10(padj), color = sig)) +
+  geom_vline(xintercept = 0, linetype = "solid", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_point() +
+  annotate("text", x = -1, y = 40, label = paste0("down=", down_count), size = 5, fontface = "bold") +
+  annotate("text", x = 1, y = 40, label = paste0("up=", up_count), size = 5, fontface = "bold") +
+  xlim(-4, 4) +
+  scale_color_manual(values = c("sig" = "red", "ns" = "blue")) +  # Red for significant, blue for non-significant
+  guides(color = FALSE) +
+  ggtitle("ATACSeq Significant Peaks") + 
+  theme_minimal() +  
+  theme(
+    panel.grid = element_blank(),  
+    panel.background = element_rect(fill = "white", color = "white"),  
+    axis.line = element_line(color = "black"),  
+    axis.title = element_text(size = 14, face = "bold"),  
+    axis.text = element_text(size = 12),  
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")  
+  )
+ggsave("~/Desktop/ATACseq/LINC00667/figures/narrow_LINC00667_atac_seq_volcano.pdf", height = 10, width = 10, useDingbats = FALSE)
+```
+
+#Heatmap of all sig peaks
+```{r}
+# Create heatmap matrix
+LINC00667_atac_sig_matrix <- LINC00667_atac_sig %>%
+  dplyr::select(interval_id, timepoint, log2FoldChange) %>%
+  pivot_wider(names_from = timepoint, names_sort = TRUE, values_from = log2FoldChange) %>%
+  column_to_rownames("interval_id") %>%
+  as.matrix()
+
+# Row centering (ordering based on first significant timepoint and max log2FoldChange)
+ordering <- LINC00667_atac_sig %>%
+  filter(abs(log2FoldChange) > 0.2) %>%
+  group_by(interval_id) %>%
+  summarize(first_tp_de = min(timepoint),
+            max_fc = max(log2FoldChange)) %>%
+  arrange(first_tp_de, -max_fc)
+
+# Adding a 0 timepoint column
+LINC00667_atac_sig_matrix <- cbind(matrix(0, nrow = nrow(LINC00667_atac_sig_matrix), ncol = 1), LINC00667_atac_sig_matrix)
+colnames(LINC00667_atac_sig_matrix)[1] <- "0"
+
+# Order the rows of the matrix based on the ordering defined above
+LINC00667_atac_sig_matrix <- LINC00667_atac_sig_matrix[ordering$interval_id, ]
+LINC00667_atac_sig_matrix <- LINC00667_atac_sig_matrix[ordering$interval_id, ]
+
+# Create row heatmap annotation (black for DEG, white for non-DEG)
+row_ha <- rowAnnotation(deg = as.numeric(rownames(LINC00667_atac_sig_matrix) %in% overlapping_df$interval_id[overlapping_df$deg == TRUE]),
+                        col = list(deg = c("1" = "black", "0" = "white")))
+
+LINC00667_atac_sig_gene_name <- merge(LINC00667_atac_sig, overlapping_df, by = "interval_id")
+ordering_gene_name <- LINC00667_atac_sig_gene_name %>%
+  filter(abs(log2FoldChange) > 0.2) %>%
+  group_by(interval_id) %>%
+  summarize(first_tp_de = min(timepoint),
+            max_fc = max(log2FoldChange)) %>%
+  arrange(first_tp_de, -max_fc)
+right_annotation <- rowAnnotation(gene_name = ordering_gene_name$gene_name)
+
+# Calculate min and max of the log2FoldChange values in the matrix
+logfc_min <- min(LINC00667_atac_sig_matrix, na.rm = TRUE)
+logfc_max <- max(LINC00667_atac_sig_matrix, na.rm = TRUE)
+
+# Check the range
+print(paste("Log2FoldChange range: ", logfc_min, "to", logfc_max))
+
+# Load necessary library for color palettes
+library(RColorBrewer)
+col_pal10 <- colorRampPalette(colors = c("#43071E",
+                                         "#691D32",
+                                         "#923346",
+                                         "#BD4B5C",
+                                         "#D17486",
+                                         "#E19EB0",
+                                         "#F0C5D8",
+                                         "#F8F0FE",
+                                         "#C8D0EF",
+                                         "#98B1DA",
+                                         "#6A93C6",
+                                         "#4272AE",
+                                         "#31508C",
+                                         "#1E356C",
+                                         "#0E1949"))(15)
+
+pdf(paste0("rp_LINC00667_all_atac_peaks_heatmap_", 0.05, ".pdf"), 
+    width = 5, height = 300)
+ht <- Heatmap(LINC00667_atac_sig_matrix, 
+              name = "l2fc",  
+              cluster_columns = FALSE,  
+              show_row_names = FALSE,  
+              cluster_rows = TRUE,  
+              left_annotation = row_ha,
+              #right_annotation = right_annotation,
+              col = colorRamp2(seq(2,-2,length.out = 15), col_pal10))
+              #col = colorRamp2(c(logfc_min, 0, logfc_max), c("#0E1949", "white", "#43071E")),  
+              heatmap_legend_param = list(
+                  title_gp = gpar(fontsize = 14, fontface = "bold"),  
+                  labels_gp = gpar(fontsize = 12))
+              column_names_gp = gpar(fontsize = 14) 
+
+
+draw(ht, 
+     column_title = "ATACSeq Significant Peaks",  
+     column_title_gp = gpar(fontsize = 16, fontface = "bold"),  
+     heatmap_legend_side = "right")
+dev.off()
+```
+
+#Heatmap of sig peaks and sig genes relative expression
+```{r}
+tpm <- read.table("/scratch/Shares/rinn/lincxpress/LINC00667/rnaseq/nextflow_results/star_salmon/salmon.merged.gene_tpm.tsv", header=TRUE, row.names=1)
+
+samples <- data.frame(
+  sample_id = colnames(tpm))
+
+split_values <- strsplit(samples$sample_id, "_")
+
+time_values <- sapply(split_values, function(x) x[[2]])
+
+samples$timepoint <- time_values
+# filtering to significant genes that have atac peaks within 100Kb
+peak_gene_overlaps <- overlapping_df %>% filter(deg == TRUE)
+
+# subsetting to interval_id and gene name
+peak2gene <- peak_gene_overlaps %>%
+  dplyr::select(interval_id, gene_name)
+
+# filter expression values of genes that have sig deg and sig atac
+expr <- tpm %>% 
+  filter(gene_name %in% peak_gene_overlaps$gene_name) %>%
+  pivot_longer(3:ncol(.), names_to = "sample_id", values_to = "tpm") %>%
+  left_join(samples) %>%
+  group_by(timepoint, gene_name) %>%
+  summarize(tpm = mean(tpm), .groups = "drop") %>%
+  mutate(timepoint = as.numeric(as.character(timepoint))) %>%
+  left_join(peak2gene, relationship = "many-to-many")  # Set relationship to many-to-many
+
+
+# Perform rlog transformation
+rlog_counts <- rlog(atac_dds, blind = TRUE)
+
+# Convert rlog counts to a dataframe and move rownames (interval_id) to a column
+atac_rlog_counts <- as.data.frame(assay(rlog_counts)) %>%
+  rownames_to_column("interval_id")
+
+# Reshape from wide to long format and merge with sample metadata
+atac_rlog_counts <- atac_rlog_counts %>%
+  pivot_longer(cols = -interval_id, names_to = "sample_name", values_to = "count") %>%
+  left_join(col_data, by = c("sample_name" = "sample_name"))
+
+# getting rlog counts for atac peaks
+peak2gene_unique <- peak2gene %>%
+  distinct(interval_id, .keep_all = TRUE)
+
+peak <- atac_rlog_counts %>%
+  filter(interval_id %in% peak_gene_overlaps$interval_id) %>%
+  group_by(timepoint, interval_id) %>%
+  summarize(atac_peak_count = mean(count), .groups = "drop") %>%
+  left_join(peak2gene_unique)
+
+
+peak <- peak %>%
+  mutate(timepoint = as.integer(gsub("h", "", timepoint)))
+
+# merging in tpm of deg genes and rlog of sig atac peaks overlapping deg
+expr <- expr %>%
+  mutate(timepoint = as.integer(as.character(timepoint)))
+
+combined_expr_peak <- expr %>% left_join(peak)
+
+# Normalize values between min and max = percentage of signal for each gene
+# 0 = min val and 1 = max
+# this just defines the function that will be run (range01) on each row 
+range01 <- function(x){(x-min(x, na.rm = TRUE))/(max(x, na.rm = TRUE)-min(x, na.rm = TRUE))}
+
+# now running min max normalization function for tpm adn atac counts
+combined_expr_peak <- combined_expr_peak %>%
+  group_by(gene_name) %>%
+  mutate(rel_tpm = range01(tpm),
+         rel_atac = range01(atac_peak_count),
+         scaled_tpm = scale(tpm),
+         scaled_atac = scale(atac_peak_count))
+
+
+# pivot longer so each gene has two enteries per time point one for atac and one for rel_tpm
+expr_peak_l <- combined_expr_peak %>%
+  dplyr::select(timepoint, gene_name, rel_tpm, rel_atac) %>%
+  pivot_longer(3:4, names_to = "signal_type", values_to = "rel_signal") %>%
+  mutate(signal_type = gsub("rel_tpm", "expr", signal_type),
+         signal_type = gsub("rel_atac", "atac", signal_type))
+
+col_pal10 <- colorRampPalette(colors = c("#43071E",
+                                         "#691D32",
+                                         "#923346",
+                                         "#BD4B5C",
+                                         "#D17486",
+                                         "#E19EB0",
+                                         "#F0C5D8",
+                                         "#F8F0FE",
+                                         "#C8D0EF",
+                                         "#98B1DA",
+                                         "#6A93C6",
+                                         "#4272AE",
+                                         "#31508C",
+                                         "#1E356C",
+                                         "#0E1949"))(15)
+
+# Plotting individual gene heat maps of atac and rna signal levels at each timepoint
+ggplot(expr_peak_l, aes(x = timepoint, y = signal_type, fill = rel_signal)) +
+  geom_tile() +
+  facet_wrap(~gene_name) +
+   scale_fill_gradientn(colors = col_pal10[50:0])+
+  scale_x_continuous(breaks = seq(0,300, by = 60),
+                     labels = 0:5)
+
+
+# saving
+ggsave("firre_responder_atac_timing_heatmap.pdf", height = 3.5, width = 4)
+
+```
+
+```{r}
+genes_to_plot <- c("CRABP2", "DRD4", "ENO3", "ERICH2", "ETV5", "FRY", "FYB2", 
+                   "GAD1", "GCNT1", "HTR1D", "KREMEN2", "LEFTY1", "LIX1", 
+                   "PAPLN", "PLA2G4C", "SDHAP3", "SOWAHC", "SSBP2", "WNT4")
+
+
+sig_gene_peak_info <- overlapping_df %>% filter(gene_name %in% genes_to_plot)
+
+# Deduplicate LINC00667_atac_lfc by selecting unique interval_id and ucsc_cord pairs
+LINC00667_atac_lfc_unique <- LINC00667_atac_lfc %>%
+  select(interval_id, ucsc_coord) %>%
+  distinct()
+
+# Merge deduplicated data into sig_gene_peak_info
+merged_data <- sig_gene_peak_info %>%
+  left_join(LINC00667_atac_lfc_unique, by = "interval_id")
+
+# Save the merged dataset to a CSV file
+write.csv(merged_data, "sig_gene_peak_info_with_ucsc_cord.csv", row.names = FALSE)
+
+
+```
+
+
